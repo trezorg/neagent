@@ -1,0 +1,6 @@
+colorama
+lxml
+aiohttp
+cssselect
+daemons
+aioodbc
