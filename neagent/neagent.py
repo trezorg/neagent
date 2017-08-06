@@ -19,6 +19,11 @@ from lxml import (
 from daemons import daemonizer
 
 from .args import prepare_parser
+from .sql import (
+    CREATE_TABLE_SQL,
+    prepare_select_query,
+    prepare_insert_query,
+)
 
 DB = os.path.expanduser('~/neagent.db')
 PID = '/tmp/neagent.pid'
@@ -49,14 +54,7 @@ def _prepare_logging(daemon, level=logging.INFO):
 async def _create_table(loop):
     conn = await aioodbc.connect(dsn=DSN, loop=loop, autocommit=True)
     cursor = await conn.cursor()
-    await cursor.execute("""
-        CREATE TABLE IF NOT EXISTS links (
-            id INTEGER PRIMARY KEY,
-            base_link TEXT,
-            link TEXT
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS u_links ON links(base_link, link);
-    """)
+    await cursor.execute(CREATE_TABLE_SQL)
     await cursor.close()
     await conn.close()
 
@@ -64,16 +62,12 @@ async def _create_table(loop):
 async def _store_db(loop, base_link, links):
     conn = await aioodbc.connect(dsn=DSN, loop=loop, autocommit=True)
     cursor = await conn.cursor()
-    links_req = '({})'.format(','.join(f"'{lnk}'" for lnk in links))
-    query = """
-        SELECT link FROM links WHERE base_link = '{0}' AND link IN {1}
-    """.format(base_link, links_req)
+    query = prepare_select_query(base_link, links)
     res = await cursor.execute(query)
     stored_links = (lnk.link for lnk in await res.fetchall())
     new_links = sorted(set(links) - set(stored_links))
     if new_links:
-        query = "INSERT INTO links(base_link, link) VALUES {0}".format(
-            ', '.join(f"('{base_link}', '{link}')" for link in new_links))
+        query = prepare_insert_query(base_link, new_links)
         await cursor.execute(query)
     await cursor.close()
     await conn.close()
@@ -88,38 +82,36 @@ async def _get_content(session, link):
 
 async def _get_page_links(session, link):
     page = await _get_content(session, link)
-    dochtml = html.fromstring(page)
+    doc_html = html.fromstring(page)
     select = cssselect.CSSSelector(".imd_photo a")
-    return (el.get('href') for el in select(dochtml))
+    return (el.get('href') for el in select(doc_html))
 
 
 async def _get_pages(session, link):
     page = await _get_content(session, link)
-    dochtml = html.fromstring(page)
+    doc_html = html.fromstring(page)
     select = cssselect.CSSSelector(".page_numbers a")
-    return chain((el.get('href') for el in select(dochtml)), (link,))
+    return chain((el.get('href') for el in select(doc_html)), (link,))
 
 
 async def _get_links(link):
     async with aiohttp.ClientSession() as session:
         page_links = set(await _get_pages(session, link))
-        logger.debug('Got {0} page link{1}...'.format(
+        logger.debug('Got {0} page{1}...'.format(
             len(page_links), '' if len(page_links) == 1 else 's'))
         all_page_links = [
             await _get_page_links(session, link) for link in page_links]
         links = sorted(set(chain(*all_page_links)))
-        logger.debug('Got {0} message link{1}...'.format(
+        logger.debug('Got {0} link{1}...'.format(
             len(links), '' if len(links) == 1 else 's'))
         return links
 
 
-async def _get_new_links(link, loop):
-    await _create_table(loop)
-    links = await _get_links(link)
-    new_links = await _store_db(loop, link, links)
-    logger.debug('Got {0} new link{1}...'.format(
-        len(new_links), '' if len(new_links) == 1 else 's'))
-    return new_links
+def _process_result(args, result):
+    if not args.daemon:
+        print(result)
+    with open(os.path.expanduser(args.file), 'a+') as fl:
+        fl.write(f'{result}\n')
 
 
 async def _process_loop(args, loop):
@@ -127,19 +119,23 @@ async def _process_loop(args, loop):
     timeout = args.timeout
     await _create_table(loop)
     while True:
-        links = await _get_links(link)
-        new_links = await _store_db(loop, link, links)
         cur_date = datetime.now().strftime('%Y-%m-%d %H-%M-%S')
-        result = '{}\n{}'.format(cur_date, '\n'.join(new_links)) if new_links \
-            else cur_date
-        if not args.daemon:
-            print(result)
-        with open(os.path.expanduser(args.file), 'a+') as fl:
-            fl.write(f'{result}\n')
-        await asyncio.sleep(timeout)
+        try:
+            links = await _get_links(link)
+            new_links = await _store_db(loop, link, links)
+        except aiohttp.client_exceptions.ClientError:
+            logger.exception(f'Cannot open page: {link}')
+        except Exception as _:
+            logger.exception(f'Cannot store new links: {link}')
+        else:
+            result = f'{cur_date}\n{chr(10).join(new_links)}' \
+                if new_links else cur_date
+            _process_result(args, result)
+        finally:
+            await asyncio.sleep(timeout)
 
 
-def _stop(loop, *args):
+def _stop(loop, *_):
     logger.debug('Closing application...')
     for task in asyncio.Task.all_tasks():
         task.cancel()
@@ -149,14 +145,13 @@ def _stop(loop, *args):
 
 def _start(args):
     """Point of start."""
-    _prepare_logging(args.daemon, level=logging.DEBUG)
+    level = logging.DEBUG if args.verbose else logging.INFO
+    _prepare_logging(args.daemon, level=level)
     logger.debug('Starting application...')
     loop = asyncio.get_event_loop()
-    for signame in ('SIGINT', 'SIGTERM'):
+    for sig_name in ('SIGINT', 'SIGTERM'):
         loop.add_signal_handler(
-            getattr(signal, signame),
-            partial(_stop, loop)
-        )
+            getattr(signal, sig_name),  partial(_stop, loop))
     asyncio.ensure_future(_process_loop(args, loop), loop=loop)
     try:
         loop.run_forever()

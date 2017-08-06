@@ -49,6 +49,16 @@ def prepare_parser():
     )
 
     parser.add_argument(
+        '-v',
+        '--verbose',
+        required=False,
+        action='store_true',
+        dest='verbose',
+        default=False,
+        help='Verbose mode'
+    )
+
+    parser.add_argument(
         '-l',
         '--link',
         required=True,
