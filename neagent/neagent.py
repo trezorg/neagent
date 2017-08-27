@@ -1,11 +1,9 @@
 #! /usr/bin/env python3
-"""Neagent helper."""
+"""NeAgent helper."""
 
 import asyncio
-import os
 import signal
 import logging
-from datetime import datetime
 from itertools import chain
 from logging.handlers import SysLogHandler
 from functools import partial
@@ -17,18 +15,22 @@ from lxml import (
     cssselect,
 )
 from daemons import daemonizer
+from colorama import init as colorama_init
 
-from .args import prepare_parser
+from .utils import prepare_dsn
+from .args import prepare_options
 from .sql import (
     CREATE_TABLE_SQL,
     prepare_select_query,
     prepare_insert_query,
 )
+from .notification import (
+    TelegramNotifier,
+    StdOutNotifier,
+    FileNotifier,
+)
 
-DB = os.path.expanduser('~/neagent.db')
 PID = '/tmp/neagent.pid'
-DSN = ('Driver=SQLite3;SERVER=localhost;'
-       'Database={};Trusted_connection=yes'.format(DB))
 HEADERS = {
     'Accept': ('text/html,application/xhtml+xml,'
                'application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8'),
@@ -43,24 +45,18 @@ HEADERS = {
 logger = logging.getLogger(__name__)
 
 
-def _prepare_logging(daemon, level=logging.INFO):
-    stream_handler = logging.StreamHandler()
-    syslog_handler = SysLogHandler(address='/dev/log')
-    handlers = (syslog_handler,) if daemon else \
-        (stream_handler, syslog_handler,)
-    logging.basicConfig(level=level, handlers=handlers)
-
-
-async def _create_table(loop):
-    conn = await aioodbc.connect(dsn=DSN, loop=loop, autocommit=True)
+async def _create_table(loop, db_name):
+    dsn = prepare_dsn(db_name)
+    conn = await aioodbc.connect(dsn=dsn, loop=loop, autocommit=True)
     cursor = await conn.cursor()
     await cursor.execute(CREATE_TABLE_SQL)
     await cursor.close()
     await conn.close()
 
 
-async def _store_db(loop, base_link, links):
-    conn = await aioodbc.connect(dsn=DSN, loop=loop, autocommit=True)
+async def _store_db(loop, base_link, links, db_name):
+    dsn = prepare_dsn(db_name)
+    conn = await aioodbc.connect(dsn=dsn, loop=loop, autocommit=True)
     cursor = await conn.cursor()
     query = prepare_select_query(base_link, links)
     res = await cursor.execute(query)
@@ -107,32 +103,47 @@ async def _get_links(link):
         return links
 
 
-def _process_result(args, result):
-    if not args.daemon:
-        print(result)
-    with open(os.path.expanduser(args.file), 'a+') as fl:
-        fl.write(f'{result}\n')
+async def _notify(notifiers, new_links):
+    result = f'{chr(10).join(new_links)}' if new_links else ''
+    for notifier in notifiers:
+        logger.info(f'Processing notifier {notifier.__class__.__name__}')
+        await notifier.notify(result)
 
 
 async def _process_loop(args, loop):
-    link = args.link
-    timeout = args.timeout
-    await _create_table(loop)
+    link = args['link']
+    timeout = args['timeout']
+    database = args['database']
+    await _create_table(loop, database)
+    notifiers = list(_prepare_notifiers(args))
     while True:
-        cur_date = datetime.now().strftime('%Y-%m-%d %H-%M-%S')
         try:
             links = await _get_links(link)
-            new_links = await _store_db(loop, link, links)
+            new_links = await _store_db(loop, link, links, database)
         except aiohttp.client_exceptions.ClientError:
             logger.exception(f'Cannot open page: {link}')
         except Exception as _:
-            logger.exception(f'Cannot store new links: {link}')
+            logger.exception(f'Cannot store new links for: {link}')
         else:
-            result = f'{cur_date}\n{chr(10).join(new_links)}' \
-                if new_links else cur_date
-            _process_result(args, result)
+            await _notify(notifiers, new_links)
         finally:
             await asyncio.sleep(timeout)
+
+
+def _prepare_notifiers(args):
+    if args['stdout'] and not args['daemon']:
+        yield StdOutNotifier()
+    if args.get('command') == 'telegram':
+        yield TelegramNotifier(args['bot'], args['cid'])
+    if args.get('file'):
+        yield FileNotifier(args['file'])
+
+
+def _prepare_logging(daemon, level=logging.INFO):
+    syslog_handler = SysLogHandler(address='/dev/log')
+    handlers = (syslog_handler,) if daemon else \
+        (logging.StreamHandler(), syslog_handler,)
+    logging.basicConfig(level=level, handlers=handlers)
 
 
 def _stop(loop, *_):
@@ -145,13 +156,13 @@ def _stop(loop, *_):
 
 def _start(args):
     """Point of start."""
-    level = logging.DEBUG if args.verbose else logging.INFO
-    _prepare_logging(args.daemon, level=level)
+    level = logging.DEBUG if args['verbose'] else logging.INFO
+    _prepare_logging(args['daemon'], level=level)
     logger.debug('Starting application...')
     loop = asyncio.get_event_loop()
     for sig_name in ('SIGINT', 'SIGTERM'):
         loop.add_signal_handler(
-            getattr(signal, sig_name),  partial(_stop, loop))
+            getattr(signal, sig_name), partial(_stop, loop))
     asyncio.ensure_future(_process_loop(args, loop), loop=loop)
     try:
         loop.run_forever()
@@ -163,8 +174,11 @@ def _start(args):
 
 def main():
     """Enter point."""
-    args = prepare_parser().parse_args()
-    if not args.daemon:
+    args = prepare_options()
+    if not args:
+        return
+    colorama_init()
+    if not args['daemon']:
         _start(args)
     else:
         daemonizer.run(pidfile=PID)(_start)(args)

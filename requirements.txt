@@ -4,3 +4,4 @@ aiohttp
 cssselect
 daemons
 aioodbc
+PyYAML

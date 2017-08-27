@@ -1,0 +1,6 @@
+cid: "1"
+bot: "43934:AAEKZu"
+file: "~/neagent.txt"
+link: "http://neagent.by/board/minsk/?hasPhotos=1&catid=1&district=19,29&roomCount=1&priceMax=400&currency=2"
+timeout: 3600
+daemon: False
